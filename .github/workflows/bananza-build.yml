@@ -327,14 +327,16 @@ jobs:
       actions: read
     env:
       GH_TOKEN: ${{ github.token }}
-      PARTS_DIR: ${{ runner.temp }}/ipa-parts
     steps:
       - name: Download the IPA parts from this run
         run: |
           set -euo pipefail
-          mkdir -p "$PARTS_DIR"
-          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name DonkeyKongBananza-ios-ipa-parts --dir "$PARTS_DIR"
-          ls -l "$PARTS_DIR"
+          # The runner context is not available in a job-level env, so the folder is set here and shared with the next steps.
+          parts_dir="$RUNNER_TEMP/ipa-parts"
+          echo "PARTS_DIR=$parts_dir" >> "$GITHUB_ENV"
+          mkdir -p "$parts_dir"
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name DonkeyKongBananza-ios-ipa-parts --dir "$parts_dir"
+          ls -l "$parts_dir"
 
       - name: Check the parts against SHA256SUMS.txt
         run: |
