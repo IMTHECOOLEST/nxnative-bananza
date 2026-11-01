@@ -21,7 +21,7 @@
  
 --- /dev/null
 +++ b/.github/workflows/bananza-build.yml
-@@ -0,0 +1,398 @@
+@@ -0,0 +1,399 @@
 +name: bananza-build
 +
 +# Builds Donkey Kong Bananza from an already-extracted game folder (base/, updates/, dlc/) kept in a .zip.
@@ -115,7 +115,8 @@
 +        run: |
 +          brew install xcodegen zstd glslang
 +          brew install --cask dotnet-sdk
-+          python3 -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic "backports.zstd; python_version < '3.14'"
++          # Homebrew's Python is "externally managed" (PEP 668): on this throwaway runner it is fine to override that.
++          python3 -m pip install --break-system-packages lz4 "capstone>=5,<6" fonttools nsz zbic "backports.zstd; python_version < '3.14'"
 +
 +      - name: Download and unzip the ROM dump
 +        env:
