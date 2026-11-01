@@ -1,0 +1,422 @@
+--- a/README.md
++++ b/README.md
+@@ -4,7 +4,7 @@
+ 
+ It is not an emulator: the game's own code runs directly on the Apple chip, with Switch graphics rebuilt on Metal. Nothing from any game is in this repository, and the project is not affiliated with Nintendo or any game publisher.
+ 
+-Switch 2 games have started too: [Donkey Kong Bananza](dm/games/040074A01BF12000/README.md) plays on the Mac, packed from a dump of the game; iPhone and iPad are untested.
++Switch 2 games have started too: [Donkey Kong Bananza](dm/games/040074A01BF12000/README.md) plays on the Mac, packed from a dump of the game; a workflow now also builds iPhone and iPad IPAs from an extracted dump (split into parts and put into a draft release), but device testing is still open.
+ 
+ ## Acknowledgements
+ 
+--- a/dm/games/040074A01BF12000/README.md
++++ b/dm/games/040074A01BF12000/README.md
+@@ -1,6 +1,6 @@
+ # Donkey Kong Bananza (`040074A01BF12000`)
+ 
+-A Switch 2 game: update v458752 over the base game, SDK 20.5.19 built for the Switch 2 (`sdk` names its spec `Ounce`), NVN2. Nintendo EPD's engine (sead / agl / gsys, Phive), modules `main` + `sdk`. **Plays on the Mac** (M4 Pro): three play sessions of about 5 minutes each and scripted runs of up to 15,900 frames, through the opening, the mining tunnel and the areas after it, with the guide movies in their panel, at 60 fps; in busy scenes the game drops itself to 30 fps for a few seconds ([Open](#open)). The first start with no pipeline archive builds the pipelines for about 4 minutes, once. Nothing past the first level's opening areas is tested; iOS is untested.
++A Switch 2 game: update v458752 over the base game, SDK 20.5.19 built for the Switch 2 (`sdk` names its spec `Ounce`), NVN2. Nintendo EPD's engine (sead / agl / gsys, Phive), modules `main` + `sdk`. **Plays on the Mac** (M4 Pro): three play sessions of about 5 minutes each and scripted runs of up to 15,900 frames, through the opening, the mining tunnel and the areas after it, with the guide movies in their panel, at 60 fps; in busy scenes the game drops itself to 30 fps for a few seconds ([Open](#open)). The first start with no pipeline archive builds the pipelines for about 4 minutes, once. Nothing past the first level's opening areas is tested; iPhone and iPad builds are produced by the new workflow, but device testing remains open.
+ 
+ ## What it needs
+ 
+--- /dev/null
++++ b/.github/workflows/bananza-build.yml
+@@ -0,0 +1,398 @@
++name: bananza-build
++
++# Builds Donkey Kong Bananza from an already-extracted game folder (base/, updates/, dlc/) kept in a .zip.
++# The zip's URL lives in the repository secret BANANZA_DUMP_URL (Settings > Secrets and variables > Actions).
++#
++# Targets: iPhone 15 Pro / A17 Pro or newer and iPad / Mac with M1 or newer (the host does not decompress
++# BC textures, so the GPU must read them). The Metal shader libraries are built for the Metal renderer.
++# The IPA comes out split into parts: join them with `cat` (see docs/combine-ipa-a-shell.md for a-Shell).
++#
++# When the build has finished, a second job puts the split IPA parts (with SHA256SUMS.txt, COMBINE.txt and
++# verify_ipa.py) into a DRAFT release of this repository. A draft is visible only to people with write access.
++# The parts contain the game's data: leave the release as a draft and do not publish it.
++
++on:
++  workflow_dispatch:
++    inputs:
++      part_size_mb:
++        description: "Size of each split IPA part in MiB (1900 keeps every part under 2 GiB)"
++        required: false
++        default: "1900"
++        type: string
++      build_mac_app:
++        description: "Also build the Mac app (Apple silicon, M1 or later) after the IPA"
++        required: false
++        default: true
++        type: boolean
++      draft_release:
++        description: "When the build is complete, put the split IPA parts into a draft release (parts must be under 2 GiB)"
++        required: false
++        default: true
++        type: boolean
++
++permissions:
++  contents: read
++
++concurrency:
++  group: bananza-build
++  cancel-in-progress: true
++
++env:
++  DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
++  GAME: 040074A01BF12000
++  APP_NAME: DonkeyKongBananza
++
++defaults:
++  run:
++    shell: bash
++
++jobs:
++  build:
++    name: Build Donkey Kong Bananza iOS IPA (split) and Mac app
++    runs-on: xcode-27
++    timeout-minutes: 240
++    steps:
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++        with:
++          persist-credentials: false
++
++      - name: Check the secret and the inputs
++        env:
++          DUMP_URL: ${{ secrets.BANANZA_DUMP_URL }}
++          PART_SIZE_MB: ${{ inputs.part_size_mb }}
++          DRAFT_RELEASE: ${{ inputs.draft_release }}
++        run: |
++          set -euo pipefail
++
++          if [ -z "$DUMP_URL" ]; then
++            echo "::error title=Missing secret::Add the repository secret BANANZA_DUMP_URL (Settings > Secrets and variables > Actions) with the URL of the .zip that holds the extracted game folder."
++            exit 1
++          fi
++
++          part_mb="$(printf '%s' "$PART_SIZE_MB" | tr -d '[:space:]')"
++          case "$part_mb" in
++            ''|*[!0-9]*) echo "::error::part_size_mb must be a whole number of MiB, got '$PART_SIZE_MB'"; exit 1 ;;
++          esac
++          if [ "$part_mb" -lt 50 ]; then
++            echo "::error::part_size_mb must be at least 50 (got $part_mb)"; exit 1
++          fi
++          # A release asset must be smaller than 2 GiB (2048 MiB).
++          if [ "$DRAFT_RELEASE" = "true" ] && [ "$part_mb" -ge 2048 ]; then
++            echo "::error::part_size_mb is $part_mb: release assets must be under 2 GiB, use 2000 or less (or turn draft_release off)"; exit 1
++          fi
++
++          mkdir -p "$RUNNER_TEMP/bananza/source" "$RUNNER_TEMP/bananza/out"
++          {
++            echo "BANANZA_DIR=$RUNNER_TEMP/bananza"
++            echo "PART_MB=$part_mb"
++          } >> "$GITHUB_ENV"
++
++      - name: Install build prerequisites
++        run: |
++          brew install xcodegen zstd glslang
++          brew install --cask dotnet-sdk
++          python3 -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic "backports.zstd; python_version < '3.14'"
++
++      - name: Download and unzip the ROM dump
++        env:
++          DUMP_URL: ${{ secrets.BANANZA_DUMP_URL }}
++        run: |
++          set -euo pipefail
++          archive="$BANANZA_DIR/rom-dump.zip"
++
++          # The URL is a secret: it is passed through the environment only and never echoed.
++          curl -fsSL --retry 3 --retry-all-errors -o "$archive" "$DUMP_URL"
++
++          python3 - "$archive" "$BANANZA_DIR/source" <<'PY'
++          from __future__ import annotations
++          import pathlib, sys, zipfile
++
++          archive = pathlib.Path(sys.argv[1])
++          dest = pathlib.Path(sys.argv[2])
++
++          if not zipfile.is_zipfile(archive):
++              raise SystemExit("the downloaded file is not a .zip: the BANANZA_DUMP_URL link must serve the .zip file itself, not a web page")
++
++          dest.mkdir(parents=True, exist_ok=True)
++          base = dest.resolve()
++          with zipfile.ZipFile(archive) as z:
++              for member in z.infolist():
++                  target = (dest / member.filename).resolve()
++                  if base != target and base not in target.parents:
++                      raise SystemExit(f"unsafe path in archive: {member.filename}")
++              z.extractall(dest)
++          PY
++
++          # The zip is no longer needed: free its disk space before the big steps.
++          rm -f "$archive"
++
++          dump_root="$(python3 - "$BANANZA_DIR/source" <<'PY'
++          from pathlib import Path
++          import sys
++
++          root = Path(sys.argv[1])
++          matches = sorted(p.parents[2] for p in root.rglob('base/exefs/main.npdm') if p.is_file() and '__MACOSX' not in p.parts)
++          if not matches:
++              raise SystemExit('no extracted dump found in the zip (expected base/exefs/main.npdm)')
++          print(matches[0])
++          PY
++          )"
++          printf '%s\n' "$dump_root" > "$BANANZA_DIR/dump-root.txt"
++          echo "Dump root: $dump_root"
++
++      - name: Pack the ROM with pack_dump.py
++        run: |
++          set -euo pipefail
++          dump_root="$(cat "$BANANZA_DIR/dump-root.txt")"
++          # Writes <work>/extract/v<version>/ExeFS + RomFS.img (and <work>/aoc for DLC). The IPA and Mac builds below
++          # use the same work folder, so they reuse this packing instead of doing it again.
++          python3 scripts/pack_dump.py "$dump_root" --work-dir "$BANANZA_DIR/work"
++
++      - name: Build the iOS IPA (Metal shaders)
++        run: |
++          set -euo pipefail
++          dump_root="$(cat "$BANANZA_DIR/dump-root.txt")"
++          python3 scripts/build_ipa_from_nsp.py "$dump_root" \
++            --platform ios \
++            --title-id "$GAME" \
++            --work-dir "$BANANZA_DIR/work" \
++            --out "$BANANZA_DIR/out/$APP_NAME.ipa" \
++            --progress lines
++
++      - name: Check the IPA
++        run: |
++          set -euo pipefail
++          python3 - "$BANANZA_DIR/out/$APP_NAME.ipa" <<'PY'
++          import sys, zipfile
++
++          with zipfile.ZipFile(sys.argv[1]) as z:
++              names = z.namelist()
++          apps = sorted({n.split('/')[1] for n in names if n.startswith('Payload/') and n.count('/') >= 2 and n.split('/')[1].endswith('.app')})
++          if not apps:
++              raise SystemExit('the IPA has no Payload/<name>.app')
++          print(f"IPA: {len(names):,} entries, app {', '.join(apps)}")
++          PY
++
++      - name: Split the IPA into parts
++        run: |
++          set -euo pipefail
++          parts="$BANANZA_DIR/out/ipa-parts"
++          rm -rf "$parts"
++          mkdir -p "$parts"
++
++          python3 - "$BANANZA_DIR/out/$APP_NAME.ipa" "$parts" "$PART_MB" <<'PY'
++          import hashlib, pathlib, sys
++
++          ipa = pathlib.Path(sys.argv[1])
++          dest = pathlib.Path(sys.argv[2])
++          part_bytes = int(sys.argv[3]) * 1024 * 1024
++          total = ipa.stat().st_size
++          count = -(-total // part_bytes)
++          if count > 999:
++              raise SystemExit(f"{count} parts: raise part_size_mb (the part numbers have three digits)")
++
++          whole = hashlib.sha256()
++          sums = []
++          names = []
++          with ipa.open('rb') as src:
++              for i in range(1, count + 1):
++                  name = f"{ipa.name}.part{i:03d}"
++                  part = hashlib.sha256()
++                  left = part_bytes
++                  with (dest / name).open('wb') as out:
++                      while left:
++                          chunk = src.read(min(left, 16 << 20))
++                          if not chunk:
++                              break
++                          out.write(chunk)
++                          part.update(chunk)
++                          whole.update(chunk)
++                          left -= len(chunk)
++                  names.append(name)
++                  sums.append(f"{part.hexdigest()}  {name}")
++              if src.read(1):
++                  raise SystemExit("split stopped before the end of the IPA")
++
++          written = sum((dest / n).stat().st_size for n in names)
++          if written != total:
++              raise SystemExit(f"parts hold {written} bytes, the IPA has {total}")
++
++          (dest / "SHA256SUMS.txt").write_text(f"{whole.hexdigest()}  {ipa.name}\n" + "\n".join(sums) + "\n")
++
++          join = " ".join(names)
++          (dest / "COMBINE.txt").write_text(
++              f"Join the {count} parts back into {ipa.name} (a-Shell, Terminal, any shell with cat).\n"
++              f"Keep every part in ONE folder and run the command there.\n\n"
++              f"Exact command, parts in order:\n\n"
++              f"cat {join} > {ipa.name}\n\n"
++              f"Short form (the part numbers sort in order):\n\n"
++              f"cat {ipa.name}.part* > {ipa.name}\n\n"
++              f"The joined file must be exactly {total} bytes ({total / 2**30:.2f} GiB):\n\n"
++              f"ls -l {ipa.name}\n\n"
++              f"Check it with:  python3 verify_ipa.py\n"
++              f"(SHA256SUMS.txt lists the checksum of the joined IPA and of every part.)\n"
++          )
++          print(f"{ipa.name}: {total:,} bytes -> {count} part(s) of up to {part_bytes // 2**20} MiB")
++          PY
++
++          # verify_ipa.py: checks the parts and/or the joined IPA against SHA256SUMS.txt. Plain Python 3, runs in a-Shell.
++          cat > "$parts/verify_ipa.py" <<'PY'
++          import hashlib, os, sys
++
++          here = os.path.dirname(os.path.abspath(__file__))
++          sums = os.path.join(here, "SHA256SUMS.txt")
++          if not os.path.isfile(sums):
++              raise SystemExit("SHA256SUMS.txt must be in the same folder as verify_ipa.py")
++
++          bad = found = 0
++          for line in open(sums):
++              line = line.strip()
++              if not line:
++                  continue
++              want, name = line.split(None, 1)
++              path = os.path.join(here, name)
++              if not os.path.isfile(path):
++                  print("not here:", name)
++                  continue
++              found += 1
++              h = hashlib.sha256()
++              with open(path, "rb") as f:
++                  for chunk in iter(lambda: f.read(1 << 20), b""):
++                      h.update(chunk)
++              ok = h.hexdigest() == want
++              bad += not ok
++              print("OK     " if ok else "BAD    ", name)
++          if not found:
++              raise SystemExit("none of the listed files are in this folder")
++          print("All files found are correct." if not bad else f"{bad} file(s) are damaged: copy them again.")
++          sys.exit(1 if bad else 0)
++          PY
++
++          if [ -f docs/combine-ipa-a-shell.md ]; then
++            cp docs/combine-ipa-a-shell.md "$parts/combine-ipa-a-shell.md"
++            printf '\nStep by step for a-Shell: combine-ipa-a-shell.md\n' >> "$parts/COMBINE.txt"
++          else
++            echo "::notice::docs/combine-ipa-a-shell.md is not in the repository, so the tutorial is not added to the artifact"
++          fi
++          ls -l "$parts"
++
++      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
++        with:
++          name: DonkeyKongBananza-ios-ipa-parts
++          path: ${{ runner.temp }}/bananza/out/ipa-parts
++          compression-level: 0
++          if-no-files-found: error
++          retention-days: 7
++
++      - name: Free disk space (the IPA and its parts are uploaded)
++        run: |
++          set -euo pipefail
++          rm -rf "$BANANZA_DIR/out/ipa-parts" "$BANANZA_DIR/out/$APP_NAME.ipa"
++
++      - name: Build the Mac app
++        if: ${{ inputs.build_mac_app }}
++        run: |
++          set -euo pipefail
++          dump_root="$(cat "$BANANZA_DIR/dump-root.txt")"
++          python3 scripts/build_ipa_from_nsp.py "$dump_root" \
++            --platform mac-app \
++            --title-id "$GAME" \
++            --work-dir "$BANANZA_DIR/work" \
++            --out "$BANANZA_DIR/out/$APP_NAME.app" \
++            --progress lines
++
++          # A zip made with ditto keeps the executable bits, symlinks and the ad-hoc signature (upload-artifact would drop them).
++          ditto -c -k --sequesterRsrc --keepParent "$BANANZA_DIR/out/$APP_NAME.app" "$BANANZA_DIR/out/$APP_NAME-mac-app.zip"
++          rm -rf "$BANANZA_DIR/out/$APP_NAME.app"
++          ls -l "$BANANZA_DIR/out"
++
++      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
++        if: ${{ inputs.build_mac_app }}
++        with:
++          name: DonkeyKongBananza-mac-app
++          path: ${{ runner.temp }}/bananza/out/DonkeyKongBananza-mac-app.zip
++          compression-level: 0
++          if-no-files-found: error
++          retention-days: 7
++
++  draft-release:
++    name: Put the split IPA parts into a draft release
++    needs: build
++    if: ${{ inputs.draft_release }}
++    runs-on: ubuntu-latest
++    timeout-minutes: 120
++    # Only this job can write to the repository: the build job above stays read-only.
++    permissions:
++      contents: write
++      actions: read
++    env:
++      GH_TOKEN: ${{ github.token }}
++    steps:
++      - name: Download the IPA parts from this run
++        run: |
++          set -euo pipefail
++          # The runner context is not available in a job-level env, so the folder is set here and shared with the next steps.
++          parts_dir="$RUNNER_TEMP/ipa-parts"
++          echo "PARTS_DIR=$parts_dir" >> "$GITHUB_ENV"
++          mkdir -p "$parts_dir"
++          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name DonkeyKongBananza-ios-ipa-parts --dir "$parts_dir"
++          ls -l "$parts_dir"
++
++      - name: Check the parts against SHA256SUMS.txt
++        run: |
++          set -euo pipefail
++          cd "$PARTS_DIR"
++          # The joined IPA is not in this folder, so verify_ipa.py reports it as "not here" and checks every part.
++          python3 verify_ipa.py
++
++      - name: Create the draft release and upload the parts
++        run: |
++          set -euo pipefail
++          cd "$PARTS_DIR"
++          tag="bananza-ipa-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
++
++          {
++            echo "Donkey Kong Bananza iOS IPA, split into parts (workflow run ${GITHUB_RUN_NUMBER})."
++            echo
++            echo "Build log: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
++            echo
++            echo '```'
++            cat COMBINE.txt
++            echo '```'
++          } > "$RUNNER_TEMP/release-notes.md"
++
++          # --draft: the tag is only created if the release is ever published. A draft is visible to people with write access only.
++          url="$(gh release create "$tag" \
++            --repo "$GITHUB_REPOSITORY" \
++            --draft \
++            --target "$GITHUB_SHA" \
++            --title "Donkey Kong Bananza iOS IPA (run ${GITHUB_RUN_NUMBER})" \
++            --notes-file "$RUNNER_TEMP/release-notes.md")"
++
++          upload() {
++            local file="$1" attempt
++            for attempt in 1 2 3; do
++              if gh release upload "$tag" "$file" --repo "$GITHUB_REPOSITORY" --clobber; then
++                return 0
++              fi
++              echo "::warning::uploading $file failed (attempt $attempt of 3)"
++              sleep 20
++            done
++            echo "::error::could not upload $file"
++            return 1
++          }
++
++          for file in *; do
++            if [ -f "$file" ]; then
++              upload "$file"
++            fi
++          done
++
++          echo "Draft release: $url"
++          {
++            echo "### Draft release"
++            echo
++            echo "The split IPA parts are in a draft release: $url"
++            echo
++            echo "Only people with write access can see it. Leave it as a draft."
++          } >> "$GITHUB_STEP_SUMMARY"
