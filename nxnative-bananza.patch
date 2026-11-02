@@ -21,7 +21,7 @@
  
 --- /dev/null
 +++ b/.github/workflows/bananza-build.yml
-@@ -0,0 +1,399 @@
+@@ -0,0 +1,412 @@
 +name: bananza-build
 +
 +# Builds Donkey Kong Bananza from an already-extracted game folder (base/, updates/, dlc/) kept in a .zip.
@@ -117,6 +117,19 @@
 +          brew install --cask dotnet-sdk
 +          # Homebrew's Python is "externally managed" (PEP 668): on this throwaway runner it is fine to override that.
 +          python3 -m pip install --break-system-packages lz4 "capstone>=5,<6" fonttools nsz zbic "backports.zstd; python_version < '3.14'"
++
++      - name: Install the Metal toolchain
++        run: |
++          set -euo pipefail
++          # Recent Xcode versions ship without the Metal compiler: it is a separate download.
++          # The IPA build compiles the Metal shader libraries, so this must work before anything else is spent.
++          if xcrun metal --version >/dev/null 2>&1; then
++            echo "The Metal toolchain is already installed."
++          else
++            xcodebuild -downloadComponent MetalToolchain
++          fi
++          xcrun metal --version
++          xcrun metallib --version
 +
 +      - name: Download and unzip the ROM dump
 +        env:
