@@ -1365,6 +1365,8 @@ static int ubd_lazy(void) { static int v = -1; if (v < 0) { const char *e = gete
 enum { UBD_PF = 1024 };
 static uint64_t g_ubd_pf[UBD_PF];   // pages (address >> 12, +1) the deferred updates touch, open addressing; cleared when the list is landed
 static int g_ubd_wide;              // an update spans more than 16 pages: the filter is skipped
+static uint64_t g_ubd_env_lo = UINT64_MAX, g_ubd_env_hi;   // the span of every update listed since the list was last emptied: a range outside it hits none (vertex, index and
+                                                          // storage buffers in other pools, most of each draw's lookups), answered before the page filter
 static inline unsigned ubd_pf_slot(uint64_t pg) { return (unsigned)((pg * 0x9E3779B97F4A7C15ull) >> 54) & (UBD_PF - 1); }
 // Pages inside the guest address space (0x70_0000_0000, 8 GB here on the Mac and on iOS) are kept in a bitmap as well: one load per page instead of probing the table, which was
 // most of the filter's cost (each draw asks for every buffer it binds). Pages outside it use the table only
@@ -1373,6 +1375,7 @@ static const uint64_t UBD_BM_BASE = 0x7000000000ull;
 static uint64_t g_ubd_bm[(1u << UBD_BM_SHIFT) / 64];
 static inline int ubd_bm_in(uint64_t lo, uint64_t hi) { return lo >= UBD_BM_BASE && ((hi - 1 - UBD_BM_BASE) >> 12) < (1u << UBD_BM_SHIFT); }
 static void ubd_pf_add(uint64_t lo, uint64_t hi) {
+    if (lo < g_ubd_env_lo) g_ubd_env_lo = lo; if (hi > g_ubd_env_hi) g_ubd_env_hi = hi;
     if (((hi - 1) >> 12) - (lo >> 12) > 16) { g_ubd_wide = 1; return; }
     for (uint64_t a = lo >> 12; a <= (hi - 1) >> 12; a++) if (a >= UBD_BM_BASE >> 12 && a - (UBD_BM_BASE >> 12) < (1u << UBD_BM_SHIFT)) { uint64_t pg = a - (UBD_BM_BASE >> 12); g_ubd_bm[pg >> 6] |= 1ull << (pg & 63); }   // a range across the window's edge too: a lookup inside the window asks only the bitmap
     for (uint64_t pg = lo >> 12; pg <= (hi - 1) >> 12; pg++) { unsigned k = ubd_pf_slot(pg);
@@ -1380,6 +1383,7 @@ static void ubd_pf_add(uint64_t lo, uint64_t hi) {
         g_ubd_pf[k] = pg + 1; }
 }
 static inline int ubd_pf_hit(uint64_t lo, uint64_t hi) {
+    if (hi <= g_ubd_env_lo || lo >= g_ubd_env_hi) return 0;
     if (g_ubd_wide || ((hi - 1) >> 12) - (lo >> 12) > 16) return 1;
     if (ubd_bm_in(lo, hi)) { for (uint64_t pg = (lo - UBD_BM_BASE) >> 12; pg <= (hi - 1 - UBD_BM_BASE) >> 12; pg++) if (g_ubd_bm[pg >> 6] >> (pg & 63) & 1) return 1; return 0; }
     for (uint64_t pg = lo >> 12; pg <= (hi - 1) >> 12; pg++) { unsigned k = ubd_pf_slot(pg);
@@ -1444,7 +1448,7 @@ static uint64_t ubd_shadow_(uint64_t lo, uint64_t hi) {
 }
 // Encode the deferred copies in order (rp_end, once the pass has ended)
 static void ubd_flush(void) {
-    ubd_bm_clear(); int n = g_nubd; g_nubd = 0; g_ubd_ver++; memset(g_ubd_pf, 0, sizeof g_ubd_pf); g_ubd_wide = 0;
+    ubd_bm_clear(); int n = g_nubd; g_nubd = 0; g_ubd_ver++; memset(g_ubd_pf, 0, sizeof g_ubd_pf); g_ubd_wide = 0; g_ubd_env_lo = UINT64_MAX; g_ubd_env_hi = 0;
     for (int i = 0; i < n; i++) { const ubd_ent *e = &g_ubd[i]; void *db; uint64_t dof;
         if (!mtl_addr(e->lo, e->hi - e->lo, &db, &dof)) continue;
         enc_b_copy_buffer(blit_buf(0, 0, e->lo, e->hi), e->buf, e->off, (__bridge id<MTLBuffer>)db, dof, e->hi - e->lo); g_gp_ubd++; }
@@ -3605,36 +3609,66 @@ static int tex_from_storage(const tex_t *t) {
 // the 3D textures it renders into carry IMAGE | COMPRESSIBLE. That is what Xenoblade Chronicles 3, Breath of the Wild and Tears of the Kingdom do, not an NVN rule: a 3D render target
 // with neither flag and data in its storage at first use would still be drawn into (attach gives it render-target use), but a ReadTexels of it, or a second texture object over the
 // same storage, would read the storage rather than what the GPU drew. DM_NVN_STORAGE_FIRST_USE=0 turns this off (to measure it)
-static int tex_cpu_content(const tex_t *t) {
-    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_STORAGE_FIRST_USE"); on = !e || atoi(e) != 0; }
-    if (!on || !t->mem || !t->pool || t->has_layout || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
-    int unc = !fmt_compressed(t->d.format) && t->d.target != NVN_TEXTURE_TARGET_3D;
-    uintptr_t lo = (uintptr_t)t->mem, hi = lo + t->L.size;
-    if (unc) {   // not what only the GPU or the decoder fills (a display or video-decode texture, depth or stencil); not over storage the GPU writes (gws_owned, below: it takes a lock)
-        if (fmt_depth(t->d.format) || (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE))) return 0;
-    }
+static int tex_unc(const tex_t *t) { return !fmt_compressed(t->d.format) && t->d.target != NVN_TEXTURE_TARGET_3D; }   // the uncompressed 2D kind, which the GPU can render into
+// Whether the texture's storage can be what the host takes its content from, whatever it holds now (tex_cpu_content at first use, mtl_tex_cpu_rewritten after it); unc: tex_unc
+static int tex_storage_ok(const tex_t *t, int unc) {
+    if (!t->mem || !t->pool || t->has_layout || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
+    // not what only the GPU or the decoder fills (a display or video-decode texture, depth or stencil)
+    if (unc && (fmt_depth(t->d.format) || (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE)))) return 0;
     if (t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) return 0;   // the CPU cannot write it (tex_init_fill fills it once) / sparse (tex_from_storage)
     // IMAGE only matters for an uncompressed texture: shaders cannot write a block-compressed one. Pokopia gives nearly every texture IMAGE (flags 0x4), its icons BC1 / BC7 in a
     // CPU_UNCACHED pool; left to the one-time fill, a new icon over reused storage got the previous icon's picture from the sharing table (xFractals/pokopia-native issue #1)
-    if ((t->d.flags & (NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE))
-        || ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !fmt_compressed(t->d.format))) return 0;
-    if ((unc && gws_owned(lo, hi)) || !mem_any(t->mem, t->L.size)) return 0;
-    if (unc) {
-        cpu_unc *u = malloc(sizeof *u);
-        if (!u) {
-            MDIE("tex_cpu_content: out of memory");
-        }
-        *u = (cpu_unc){t->pool, lo, hi};
+    return !((t->d.flags & (NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE))
+             || ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !fmt_compressed(t->d.format)));
+}
+static void cpu_unc_take(const tex_t *t) {   // an uncompressed texture is taken from its storage: the GPU's next write there makes it a GPU texture again (cpu_unc_drop)
+    uintptr_t lo = (uintptr_t)t->mem, hi = lo + t->L.size;
+    cpu_unc *u = malloc(sizeof *u);
+    if (!u) {
+        MDIE("cpu_unc_take: out of memory");
+    }
+    *u = (cpu_unc){t->pool, lo, hi};
 
-        uint64_t s = t->serial;
-        pthread_mutex_lock(&g_cpu_tex_mu);
-        free(nvn_hm_put(&g_cpu_unc, &s, u));
-        pthread_mutex_unlock(&g_cpu_tex_mu);
-        gws_take(lo, hi);
+    uint64_t s = t->serial;
+    pthread_mutex_lock(&g_cpu_tex_mu);
+    free(nvn_hm_put(&g_cpu_unc, &s, u));
+    pthread_mutex_unlock(&g_cpu_tex_mu);
+    gws_take(lo, hi);
+}
+static int tex_cpu_content(const tex_t *t) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_STORAGE_FIRST_USE"); on = !e || atoi(e) != 0; }
+    int unc = tex_unc(t);
+    if (!on || !tex_storage_ok(t, unc)) return 0;
+    // not over storage the GPU writes (gws_owned: it takes a lock)
+    if ((unc && gws_owned((uintptr_t)t->mem, (uintptr_t)t->mem + t->L.size)) || !mem_any(t->mem, t->L.size)) return 0;
+    if (unc) {
+        cpu_unc_take(t);
     }
     static uint64_t n[2]; if (n[unc]++ < 4) MLOG("texture written by the CPU before its first use ser=%llu %ux%ux%u format %#x%s pool flags %#x: uploaded from its storage, re-uploaded when it changes (%llu so far)",
                                          (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, unc ? " (uncompressed, in storage the GPU has not written)" : "", t->pool->flags, (unsigned long long)n[unc]);
     return 1;
+}
+// nvn_ft_poll (hle_nvn.c, tex_dirty_upload): the CPU wrote the pages of a registered texture after its first use. It is taken from its storage by the rule tex_cpu_content uses at first
+// use: a texture whose storage can hold its content (tex_storage_ok); an uncompressed 2D one not while the GPU has written that storage and the CPU has not rewritten it since (gws_owned:
+// MTL_REWRITE_GPU_NOW, which the poll asks again at the CPU's next write), and with the same way back (cpu_unc_take: the GPU's next write there makes it a GPU texture again). Its host
+// texture's usage cannot tell: tex_desc gives every uncompressed texture made without a CPU fill render-target use, and with the usage as the test every such rewrite was dropped. Ocarina of
+// Time rewrites its terrain tiles' height (260x260 R32F) and blend / hole (260x260 RGBA8, two layers) maps from the CPU as tile slots are reused while the player walks: the tiles kept
+// what they held before, flat blue holes in the ground after an hour. Its normal maps, which the CPU zeroes and the GPU then draws, stay the GPU's. A block-compressed texture is uploaded
+// whatever the GPU wrote: it cannot be rendered into, and GPU copies into it while registered are written into its storage too (tex_storage_dst), so a GPU-written span over it does not
+// make its storage stale (Tears of the Kingdom's BC4 atlas and ASTC arrays). Any other texture keeps the usage test (MTL_REWRITE_GPU: left to the GPU for good), as before
+int mtl_tex_cpu_rewritten(const tex_t *t) {
+    int unc = tex_unc(t);
+    if (tex_storage_ok(t, unc)) {
+        if (unc && gws_owned((uintptr_t)t->mem, (uintptr_t)t->mem + t->L.size)) return MTL_REWRITE_GPU_NOW;
+        mtl_tex_cpu_written(t);
+        if (unc) {
+            cpu_unc_take(t);
+        }
+        return MTL_REWRITE_UPLOADED;
+    }
+    if (mtl_tex_gpu_owned(t->serial)) return MTL_REWRITE_GPU;
+    mtl_tex_cpu_written(t);
+    return MTL_REWRITE_UPLOADED;
 }
 // The GPU writes storage an uncompressed texture was taken from: what the storage holds is no longer the whole truth, so the texture becomes a GPU texture with the content it has, and
 // CPU writes to it are no longer uploaded. Submit thread, as tex_cpu_content is, so a texture it has just taken is seen here if its storage was written meanwhile
